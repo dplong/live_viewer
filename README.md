@@ -1,3 +1,3 @@
 live_viewer
 
-HTML/JavaScript skeleton for video server integration.
+HTML/JavaScript skeleton for video-server integration.
