@@ -1,0 +1,1196 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+<HEAD>
+<TITLE></TITLE>
+<script language="Javascript" type="text/javascript" src="js/common.js"></script>
+<script language="Javascript" type="text/javascript">
+<!--
+//----------------------------------------------------------------------------
+// Constants
+// Factor for conversion between OLE Automation date and JavaScript Date()
+var MILLISECONDS_PER_DAY = 1000 * 60 * 60 * 24;
+// OLE Automation epoc (midnight 30 Dec 1899).
+var OLE_AUTOMATION_EPOC = new Date(1899, 11, 30, 0, 0, 0, 0);
+// Indicates that X or Y coordination is not set.
+var COORD_NOT_SET = -1;
+// Year for an unset position timestamp.
+var UNSET_POSITION_YEAR = (new Date(1601, 0)).getYear();
+
+//----------------------------------------------------------------------------
+// Utility functions
+//----------------------------------------------------------------------------
+
+// Ubiquitous JavaScript dollar-sign function
+function $()
+{
+    var elements = [];
+    for (var i = 0; i < arguments.length; i += 1)
+    {
+        var arg = arguments[i];
+        elements.push(typeof arg === "string" ?  document.getElementById(arg) : arg);
+    }
+    return elements.length > 1 ? elements : elements.pop();
+}
+
+// Convert OLE Automation date (floating-point days since epoc) to Date.
+function oleAutomationDateToDate(oleDate)
+{
+    var date = new Date(OLE_AUTOMATION_EPOC);
+    date.setMilliseconds(date.getMilliseconds() + oleDate * MILLISECONDS_PER_DAY);
+    return date;
+}
+
+// Convert Date to OLE Automation date (floating-point days since epoc).
+function dateToOleAutomationDate(date)
+{
+    // If missing, assume today
+    if (date === null)
+    {
+        date = new Date();
+    }
+    return (date - OLE_AUTOMATION_EPOC) / MILLISECONDS_PER_DAY;
+}
+
+//----------------------------------------------------------------------------
+// Class declarations
+//----------------------------------------------------------------------------
+
+//----------------------------------------------------------------------------
+// Abstraction of PTZ speed that can be accessed as Your or My speed.
+// Note that AsYour() and AsMine() are accessor functions and not
+// conversion functions. YourToMy() and MyToYour() are
+// conversion functions. YourToMy() also updates the internal speed
+// member variable with the assumption that the Your PTZ speed came from the
+// Your parent window.
+function PtzSpeed()
+{
+// private:
+    // Constant default, initial PTZ speed (in Your numberspace).
+    var DEFAULT_PTZ_SPEED = 5;
+
+    // We maintain speed in Your's 0-10 number space, although this isn't visible
+    // to consumer.
+    var m_speed = DEFAULT_PTZ_SPEED;
+
+    // Object array containing equivalent speeds for Your (0-10) and My
+    // (0-1000). Note that it's not linear. Also, both the sv and my values
+    // must be in ascending order.
+    var m_speeds = [
+        { your: 0, my: 0 },
+        { your: 1, my: 50 },
+        { your: 2, my: 100 },
+        { your: 3, my: 175 },
+        { your: 4, my: 290 },
+        { your: 5, my: 400 },
+        { your: 6, my: 520 },
+        { your: 7, my: 640 },
+        { your: 8, my: 760 },
+        { your: 9, my: 900 },
+        { your: 10, my: 1000 }
+    ];
+
+    // Set/get speed. All internal sets to the m_speed member variable must be
+    // done through this function so that we never store the speed as 0. The
+    // parent window uses this as a special value to stop PTZ and not really as
+    // a new speed setting.
+    function speed(speed_)
+    {
+        var speedBeforeCall = m_speed;
+        if (speed_ !== undefined && speed_ > 0)
+        {
+            m_speed = speed_;
+        }
+        return speedBeforeCall;
+    }
+
+    // Generic conversion function depending on from/to property names,
+    // 'your' and 'my'. If not exact match, the value corresponding to the next
+    // greatest value is returned. If greater than largest value, the value
+    // corresponding to largest value is returned.
+    function convert(from, fromName, toName)
+    {
+        var i;
+        for (i = 0; i < m_speeds.length && from > m_speeds[i][fromName]; i += 1)
+        {
+            // Do nothing
+        }
+        return i === m_speeds.length ?
+            m_speeds[i - 1][toName] : m_speeds[i][toName];
+    }
+
+    // Convert Your speed to My speed.
+    function yourToMy(your)
+    {
+        return convert(your, 'your', 'my');
+    }
+
+    // Convert My speed to Your speed.
+    function myToYour(my)
+    {
+        return convert(my, 'my', 'your');
+    }
+
+// public:
+    // Set/get speed as if in Your numberspace
+    this.AsYour = function (your)
+    {
+        return speed(your);
+    };
+
+    // Set/get speed as if in My numberspace
+    this.AsMine = function (my)
+    {
+        var yourSpeedBeforeCall = speed();
+        if (my !== undefined)
+        {
+            // Since we never represent Your speed as 0, if would be 0, convert
+            // to next highest Your speed. We happen to know that My speed of
+            // 1 does not convert to Your speed of 0.
+            speed(myToYour(my === 0 ? 1 : my));
+        }
+        return yourToMy(yourSpeedBeforeCall);
+    };
+
+    // Convert Your to My speed and update speed member variable.
+    this.YourToMy = function (your)
+    {
+        speed(your);
+        return yourToMy(your);
+    };
+
+    // Convert My to Your speed
+    this.MyToYour = function (my)
+    {
+        return myToYour(my);
+    };
+}
+
+//----------------------------------------------------------------------------
+// Simple class to hold camera info
+function Camera(id, server, username, password)
+{
+// public:
+    this.id = id; // E.g., "5"
+    this.server = server; // E.g., "localhost" or "192.168.0.11"
+    this.username = username; // E.g., "jackfrost"
+    this.password = password; // E.g., "Coldhearted"
+}
+
+//----------------------------------------------------------------------------
+// VCR-speed class
+function VcrSpeed(slot_, stateToString_)
+{
+// private:
+    // Callback function returning string representing viewer's slot number
+    var slot = slot_;
+
+    // Callback function returning text string describing VCR state
+    var stateToString = stateToString_;
+
+    // Core speed value that this class represents.
+    var m_speed = 0;
+
+// public:
+    // Set speed to "normal"
+    this.normal = function ()
+    {
+        this.speed(1);
+    };
+
+    // Set speed to "fast"--slightly faster than normal
+    this.fast = function ()
+    {
+        this.speed(1.5);
+    };
+
+    // Two modes: 1. If already fast, increase speed each time called,
+    // eventually wrapping back around to slightly faster than normal.
+    // 2. If not a "fast" speed, e.g., 0, set to normal.
+    this.next = function ()
+    {
+        this.speed({ 0: 1, 1: 1, 1.5: 2, 2: 3, 3: 4, 4: 1.5 }[this.speed()]);
+    };
+
+    // Set speed to stopped. This does not stop the VCR, it just sets the
+    // speed to "stopped."
+    this.stopped = function ()
+    {
+        this.speed(0);
+    };
+
+    // Set speed locally. If changed, notify ActiveX control.
+    this.speed = function (speed_)
+    {
+        var speedBeforeCall = m_speed;
+        if (speed_ !== undefined)
+        {
+            if (speed_ !== m_speed)
+            {
+                m_speed = speed_;
+                // Our local speed value of 0 is same as 1 to ActiveX control.
+                if (speed_ === 0)
+                {
+                    speed_ = 1;
+                }
+                $("oViewer").PlaybackRate(speed_);
+            }
+            this.print();
+        }
+        return speedBeforeCall;
+    };
+
+    // Pass speed and status text up to parent for display to user.
+    this.print = function ()
+    {
+        var speedString = (this.speed() === 1 || this.speed() === 0) ?
+            "" : (this.speed() + " X");
+        try {
+            window.parent.setText("cameraSpeed_" + slot(), speedString);
+            window.parent.setText("vcrStatus_" + slot(), stateToString());
+        }
+        catch (e)
+        {
+            // Do nothing
+        }
+    };
+}
+
+//----------------------------------------------------------------------------
+// Class that represents the "go" button--the button that controls whether
+// the VCR is in play or pause mode.
+function GoButton(slot, playing, playTooltip, pauseTooltip)
+{
+// private:
+    // Callback function returning string representing viewer's slot number
+    var m_slot = slot;
+
+    // Callback function returning whether a video clip is playing
+    var m_playing = playing;
+
+    // Tooltip to display when button in normal state and clip is playing
+    var m_playTooltip = playTooltip;
+
+    // Tooltip to display when button in normal state and clip is paused
+    var m_pauseTooltip = pauseTooltip;
+
+    // Display "go" button along with its tooltip
+    function display(playImage, playTooltip, pauseImage, pauseTooltip)
+    {
+        if (window.parent !== self)
+        {
+            try {
+                // If we're playing, display as pause button and vice versa
+                if (m_playing())
+                {
+                    window.parent.setPlayState(pauseImage, pauseTooltip, m_slot());
+                }
+                else {
+                    window.parent.setPlayState(playImage, playTooltip, m_slot());
+                }
+            }
+            catch (e)
+            {
+                // Do nothing
+            }
+        }
+    }
+
+// public:
+    // Display "go" button in its depressed state.
+    this.down = function ()
+    {
+        display("images/vcr_play_nc_pressed.gif", "",
+            "images/vcr_pause_nc_pressed.gif", "");
+    };
+
+    // Display "go" button in its normal state.
+    this.up = function ()
+    {
+        display("images/vcr_play_nc.gif", m_playTooltip,
+            "images/vcr_pause_nc.gif", m_pauseTooltip);
+    };
+}
+
+//----------------------------------------------------------------------------
+// Class that represents a video clip.
+function Clip(token, camera)
+{
+// public:
+    var parts = token.split(":"); // Example token: "5:40248.76357638889:40248.7640625"
+    this.camera = camera;
+    this.camera.id = parts[0]; // Overwrite old id, assuming token has correct id
+    this.start = parseFloat(parts[1]); // Start/stop clip timestamps
+    this.stop = parseFloat(parts[2]);
+}
+
+//----------------------------------------------------------------------------
+// VCR class
+function Vcr()
+{
+// private:
+    // Alias for "this" is needed for closure for some reason
+    var m_this = this;
+    var m_loaded = false; // Whether clip is loaded and ready to play
+    var m_playing = false; // Whether clip is playing (vs paused)
+    var m_slot = "0"; // "Slot" that this VCR appears within parent window.
+    var NOT_CAMERA_NUMBER = -1; // Constant dummy camera number
+
+    // Return current position within the clip
+    function getPosition()
+    {
+        return $("oViewer").Position();
+    }
+
+// public:
+    // Video clip for VCR to play
+    //
+    // (This will have to do for now, but clip needs to be created on the
+    // fly from info provided by Your network controller, e.g.,
+    // viewer.vcr.load(new Clip(token, new Camera(NOT_CAMERA_NUMBER,
+    // serverName, userName, passWord))).)
+    this.clip = new Clip("5:40248.76357638889:40248.7640625",
+        new Camera(NOT_CAMERA_NUMBER, "192.168.1.152", "admin", ""));
+
+    // Restart VCR as if it were just created
+    this.restart = function ()
+    {
+        this.pause();
+        this.state(this.State.initial);
+        m_loaded = false;
+    };
+
+    // Load video clip into viewer element as initially paused
+    this.load = function (clip)
+    {
+        var loaded = this.load_(clip);
+        if (loaded)
+        {
+            this.state(this.State.pause);
+            this.speed.stopped();
+            this.playing(false);
+        }
+
+        return loaded;
+    };
+
+    // Unload the current clip if any.
+    this.unload = function ()
+    {
+        this.restart();
+        this.clip = undefined;
+    };
+
+    // Set/get whether playing (versus paused, or stopped)
+    this.playing = function (playing_)
+    {
+        var whetherPlayingBeforeCall = m_playing;
+        if (playing_ !== undefined)
+        {
+            m_playing = playing_;
+            this.displayPosition();
+            this.goButton.up();
+        }
+        return whetherPlayingBeforeCall;
+    };
+
+    // Play video clip from current position
+    this.play = function (clip)
+    {
+        if (!this.isState(this.State.play))
+        {
+            this.state(this.State.play);
+            this.speed.normal();
+            this.play_();
+        }
+    };
+
+    // Pause video
+    this.pause = function ()
+    {
+        if (!this.isState(this.State.pause))
+        {
+            if (!m_loaded)
+            {
+                this.load();
+            }
+            else
+            {
+                this.state(this.State.pause);
+                this.speed.stopped();
+                if (this.playing())
+                {
+                    $("oViewer").Stop();
+                    this.playing(false);
+                }
+            }
+        }
+    };
+
+    // Fast forward
+    this.fastForward = function ()
+    {
+        if (this.isState(this.State.fastForward))
+        {
+            this.speed.next();
+        }
+        else
+        {
+            this.state(this.State.fastForward);
+            this.speed.fast();
+        }
+        this.play_();
+    };
+
+    // Advance to next video frame, which also pauses video if playing.
+    this.next = function ()
+    {
+        if (!m_loaded)
+        {
+            this.load();
+        }
+        else
+        {
+            $("oViewer").StepForward();
+        }
+        this.state(this.State.nextFrame);
+        this.speed.stopped();
+        this.playing(false);
+    };
+
+    // Advance to previous video frame, which also pauses video if playing.
+    this.previous = function ()
+    {
+        if (!m_loaded)
+        {
+            this.load();
+        }
+        else
+        {
+            $("oViewer").StepBack();
+        }
+        this.state(this.State.previousFrame);
+        this.speed.stopped();
+        this.playing(false);
+    };
+
+    // Rewind video clip back to beginning.
+    this.reset = function ()
+    {
+        if (!m_loaded)
+        {
+            this.load();
+        }
+        else
+        {
+            // (Seek does not affect the clip's playing/paused mode)
+            $("oViewer").Seek(this.clip.start);
+            if (!this.playing())
+            {
+                printDate(oleAutomationDateToDate(this.clip.start));
+            }
+        }
+    };
+
+    // Reposition video clip by milliseconds forwards or backwards
+    // relative to current position. Positive amount is forward;
+    // negative, reverse.
+    this.reposition = function (amountMs)
+    {
+        if (!m_loaded)
+        {
+            this.load();
+        }
+        else
+        {
+            var currentPos = this.position();
+            var date = new Date(currentPos);
+            date.setMilliseconds(date.getMilliseconds() + amountMs);
+            var newPos = dateToOleAutomationDate(date);
+            if (newPos < this.clip.start)
+            {
+                newPos = this.clip.start;
+            }
+            else if (newPos > this.clip.stop)
+            {
+                newPos = this.clip.stop;
+            }
+            if (newPos !== currentPos)
+            {
+                // (Seek does not affect the clip's playing/paused mode)
+                $("oViewer").Seek(newPos);
+                if (!this.playing())
+                {
+                    this.displayPosition();
+                }
+            }
+        }
+    };
+
+    // Return current position within the clip
+    this.position = function ()
+    {
+        return getPosition();
+    };
+
+    // Accessor function for "slot" that this VCR appears within parent window.
+    this.slot = function (slot_)
+    {
+        if (slot_ !== undefined)
+        {
+            m_slot = slot_;
+        }
+        return m_slot;
+    };
+
+    // VCR state enumeration
+    this.State = {
+        initial: "Initial",
+        play: "Play",
+        fastForward: "Fast Forward",
+        previousFrame: "Previous Frame",
+        pause: "Pause",
+        nextFrame: "Next Frame",
+        reverse: "Reverse"
+    };
+
+    // play/pause button in UI
+    this.goButton = new GoButton(
+        function ()
+        {
+            return m_this.slot();
+        },
+        function ()
+        {
+            return m_this.playing();
+        },
+        this.State.play, this.State.pause);
+
+    // Set state
+    this.state = function (newState)
+    {
+        this.state_ = newState;
+    };
+
+    // Return text string describing state
+    this.stateToString = function ()
+    {
+        return this.state_;
+    };
+
+    // Test state
+    this.isState = function (checkState)
+    {
+        return this.state_ === checkState;
+    };
+
+// private:
+    // To display each second change, must refresh slightly more often.
+    var CLIP_POSITION_DISPLAY_REFRESH_MS = 900;
+    var WHETHER_LOADED_RETRY_DELAY_MS = 250;
+    this.state_ = this.State.initial;
+
+    // Load video clip into viewer element
+    this.load_ = function (clip)
+    {
+        if (clip !== undefined)
+        {
+            this.unload();
+            this.clip = clip;
+            this.load_();
+        }
+        else if (this.clip !== undefined)
+        {
+            $("oViewer").setAttribute("Camera", this.clip.camera.id);
+            $("oViewer").setAttribute("Server", this.clip.camera.server);
+            $("oViewer").setAttribute("UserName", this.clip.camera.username);
+            $("oViewer").setAttribute("Password", this.clip.camera.password);
+            $("oViewer").Playback(this.clip.start, this.clip.stop);
+            m_loaded = true;
+        }
+        else
+        {
+            m_loaded = false;
+        }
+
+        return m_loaded;
+    };
+
+    // Play video clip from current position; load first if necessary
+    this.play_ = function (clip)
+    {
+        if (clip !== undefined || !m_loaded)
+        {
+            this.load_(clip);
+            this.playWhenLoaded();
+        }
+        else
+        {
+            if (!this.playing())
+            {
+                this.playWhenLoaded();
+            }
+        }
+    };
+
+    // Return whether the clip is loaded (position is not unset--not 1/1/1601).
+    // Caller can provide position.
+    function clipIsLoaded(position)
+    {
+        if (position === undefined)
+        {
+            position = getPosition();
+        }
+        return (new Date(position).getYear()) !== UNSET_POSITION_YEAR;
+    };
+
+    // Display current position within clip. Continue while playing.
+    this.displayPosition = function ()
+    {
+        printDate();
+
+        if (this.playing())
+        {
+            var m_this = this;
+            setTimeout(
+                function ()
+                {
+                    m_this.displayPosition();
+                },
+                CLIP_POSITION_DISPLAY_REFRESH_MS);
+        }
+    };
+
+    // Play video once clip is loaded. May already be loaded and positioned
+    // anywhere.
+    this.playWhenLoaded = function ()
+    {
+        if (clipIsLoaded())
+        {
+            $("oViewer").Start();
+            this.playing(true);
+        }
+        else
+        {
+            var m_this = this;
+            setTimeout(
+                function ()
+                {
+                    m_this.playWhenLoaded();
+                },
+                WHETHER_LOADED_RETRY_DELAY_MS);
+        }
+    };
+
+    // Represents the VCR speed setting
+    this.speed = new VcrSpeed(
+        function ()
+        {
+            return m_this.slot();
+        },
+        function ()
+        {
+            return m_this.stateToString();
+        });
+
+}
+
+// Class that represents a camera preset. Constructor takes preset number;
+// preset operations may then be performed on the preset object.
+function Preset(number)
+{
+// private:
+    // Number associated with a physical camera position
+    var m_number = number;
+
+// public:
+    // Go to the camera position associated with this preset
+    this.goTo = function ()
+    {
+        try {
+            $("oViewer").object.GotoPreset(m_number);
+        }
+        catch (e)
+        {
+            // Do nothing
+        }
+    };
+
+    // Associate the current camera position with this preset
+    this.set = function ()
+    {
+        try {
+            $("oViewer").object.SetPreset(m_number);
+        }
+        catch (e)
+        {
+            // Do nothing
+        }
+    };
+}
+
+function Mouse()
+{
+// public:
+    // Whether the mouse wheel is scrolling while cursor on video.
+    this.scrolling = false;
+
+    // Whether the mouse button is depressed.
+    this.buttonDown = false;
+
+    // Previous mouse-cursor coordinates.
+    this.cursor = {
+        x: { previous: COORD_NOT_SET, delta: function () { return event.x - this.previous; } },
+        y: { previous: COORD_NOT_SET, delta: function () { return event.y - this.previous; } },
+        haveCoordinates: function () { return this.x.previous !== COORD_NOT_SET && this.y.previous !== COORD_NOT_SET; },
+        saveCoordinates: function () { this.x.previous = event.x; this.y.previous = event.y; }
+    };
+
+    // Return whether user control of PTZ has ceased after being active
+    this.controlStopped = function ()
+    {
+        return this.scrolling ||
+            (this.cursor.haveCoordinates() && !this.buttonDown);
+    };
+
+    // Reset variables that can indicate the mouse was controlling PTZ
+    this.clearControl = function ()
+    {
+        this.scrolling = false;
+        this.cursor.x.previous = COORD_NOT_SET;
+        this.cursor.y.previous = COORD_NOT_SET;
+    };
+}
+
+// Class on which PTZ operations are performed
+function Ptz()
+{
+// private:
+    // Return speed as 0 or with correct sign based on sign of direction
+    function orientSpeed(speed, delta)
+    {
+        if (delta < 0)
+        {
+            speed = -speed;
+        } else if (delta === 0)
+        {
+            speed = 0;
+        }
+        return speed;
+    }
+
+// public:
+    // Last reported PTZ speed from the enclosing script. Kind of a hack.
+    this.speed = new PtzSpeed();
+
+    // Pan camera along X axis
+    this.pan = function (direction, speed)
+    {
+        $("oViewer").object.PTZ(this.preMove(direction, speed), 0, 0);
+    };
+
+    // Tilt camera along Y axis
+    this.tilt = function (direction, speed)
+    {
+        $("oViewer").object.PTZ(0, this.preMove(direction, speed), 0);
+    };
+
+    // Zoom camera along Z axis
+    this.zoom = function (direction, speed)
+    {
+        $("oViewer").object.PTZ(0, 0, this.preMove(direction, speed));
+    };
+
+    // Stop movement on all axes and reset info related to whatever could have
+    // caused motion
+    this.stop = function ()
+    {
+        $("oViewer").object.PTZRepeat = false;
+        $("oViewer").object.PTZ(0, 0, 0);
+    };
+
+    // Pan and tilt camera simultaneously along both X and Y axes
+    this.panTilt = function (deltaX, deltaY)
+    {
+        var panSpeed = this.speed.AsMine();
+        var tiltSpeed = panSpeed;
+
+        // Scale speeds relative to each other based on deltas
+        var absDeltaX = Math.abs(deltaX);
+        var absDeltaY = Math.abs(deltaY);
+        var deltaDelta = absDeltaX - absDeltaY;
+        if (deltaDelta > 0)
+        {
+            tiltSpeed = tiltSpeed * absDeltaY / absDeltaX;
+        } else if (deltaDelta < 0)
+        {
+            panSpeed = panSpeed * absDeltaX / absDeltaY;
+        }
+
+        $("oViewer").object.PTZRepeat = false;
+        $("oViewer").object.PTZ(orientSpeed(panSpeed, deltaX),
+            orientSpeed(tiltSpeed, deltaY), 0);
+    };
+
+    // Return a Preset object that represents the camera position associated
+    // with this number
+    this.preset = function (number)
+    {
+        return new Preset(number);
+    };
+
+// private:
+    // Common preparation for a pan, tilt, or zoom movement.
+    this.preMove = function (direction, speed)
+    {
+        $("oViewer").object.PTZRepeat = false;
+        speed = this.speed.YourToMy(speed);
+        return direction < 0 ? -speed : speed;
+    };
+}
+
+// Class representing the viewing of live video. Camera parameter is
+// optional--it can be provided later via the camera() method.
+function Live(camera)
+{
+// public:
+    // Accessor function for registering the camera being viewed
+    this.camera = function (camera)
+    {
+        $("oViewer").setAttribute("Camera", camera.id);
+        $("oViewer").setAttribute("Server", camera.server);
+        $("oViewer").setAttribute("UserName", camera.username);
+        $("oViewer").setAttribute("Password", camera.password);
+        $("cameraTime").style.display = "none";
+        $("liveVideoSpan").style.display = "inline";
+        $("NoAccess").style.display = "none";
+        $("oViewer").Connect();
+    };
+
+    if (camera)
+    {
+        this.camera(camera);
+    }
+
+    // Pan, tilt, zoom camera control.
+    this.ptz = new Ptz();
+}
+
+// Highest-level class, representing a "viewer" mechanism containing VCR and
+// live components.
+function Viewer()
+{
+// public:
+    // Parochial info about mouse controlling the PTZ and live components
+    this.mouse = new Mouse();
+
+    // VCR object. Used for viewing a video clip.
+    this.vcr = new Vcr();
+
+    // Live object for viewing live video from a camera.
+    this.live = new Live();
+
+    // Viewer state enumeration
+    this.State = {
+        initial: "Initial",
+        vcr: "VCR",
+        live: "Live"
+    };
+
+    // Set state
+    this.state = function (newState)
+    {
+        if (this.state_ !== newState)
+        {
+            this.vcr.state(this.vcr.State.initial);
+            this.state_ = newState;
+        }
+        return this.state_;
+    };
+
+    // Test state
+    this.isState = function (checkState)
+    {
+        return this.state_ === checkState;
+    };
+
+    // If viewer not already in VCR mode, place it in that mode, paused.
+    this.assureVcr = function ()
+    {
+        if (this.isState(this.State.live))
+        {
+            $("oViewer").Disconnect();
+            this.state(this.State.vcr);
+            this.vcr.restart();
+        }
+    };
+
+// private:
+    this.state_ = this.State.initial;
+}
+
+//----------------------------------------------------------------------------
+// Object definition
+//----------------------------------------------------------------------------
+
+// Main, viewer object.
+var viewer = new Viewer();
+
+//----------------------------------------------------------------------------
+// Functions to load, initialize and manipulate the ActiveX image viewer control
+//----------------------------------------------------------------------------
+
+//----------------------------------------------------------------------------
+// Function to handle pan if this is a PTZ camera. We are called from the enclosing page
+// -1 is left, 1 is right
+function panCamera(direction, speed, action)
+{
+    viewer.live.ptz.pan(direction, speed);
+}
+
+//----------------------------------------------------------------------------
+// Function to handle tilt if this is a PTZ camera. We are called from the enclosing page
+// -1 is up, 1 is down
+function tiltCamera(direction, speed, action)
+{
+    viewer.live.ptz.tilt(direction, speed);
+}
+
+//----------------------------------------------------------------------------
+// Function to handle zoom if this is a PTZ camera. We are called from the enclosing page
+// negative is out, positive is in
+function zoomCamera(direction, speed, action)
+{
+    viewer.live.ptz.zoom(direction, speed);
+}
+
+//----------------------------------------------------------------------------
+// Function to handle presets if this is a PTZ camera. We are called from the enclosing page
+function presetCamera(number)
+{
+    viewer.live.ptz.preset(number).goTo();
+}
+
+//----------------------------------------------------------------------------
+// Called when mouse wheel scrolled over video. Just starts zooming.
+function onScrollWheel()
+{
+    viewer.live.ptz.zoom(event.wheelDelta >= 0 ? 1 : -1,
+        viewer.live.ptz.speed.AsYour());
+    viewer.mouse.scrolling = true;
+//    event.returnValue = false;
+    return false;
+}
+
+//----------------------------------------------------------------------------
+// Called when mouse moves over video.
+function onMouseMove()
+{
+    // Need to stop PTZ?
+    if (viewer.mouse.controlStopped())
+    {
+        viewer.live.ptz.stop();
+        viewer.mouse.clearControl();
+    }
+    else
+    {
+        // Moving mouse with button down means pan/tilt.
+        if (viewer.mouse.buttonDown)
+        {
+            // Need previous coordinates before we can figure out pan/tilt speeds
+            if (viewer.mouse.cursor.haveCoordinates())
+            {
+                viewer.live.ptz.panTilt(viewer.mouse.cursor.x.delta(),
+                    viewer.mouse.cursor.y.delta());
+            }
+            viewer.mouse.cursor.saveCoordinates();
+        }
+    }
+    return false;
+}
+
+//----------------------------------------------------------------------------
+// Called when a mouse button is depressed over video.
+function onMouseDown()
+{
+    viewer.mouse.buttonDown = true;
+    return false;
+}
+
+//----------------------------------------------------------------------------
+// Called when a mouse button is released over video.
+function onMouseUp()
+{
+    viewer.mouse.buttonDown = false;
+    return false;
+}
+
+//----------------------------------------------------------------------------
+// Update a printable version of the date in the display.
+// (Since we don't request each frame, there can be no skew.)
+function printDate(dateTime)
+{
+    if (dateTime === undefined)
+    {
+        if (oViewer === null)
+        {
+            dateTime = new Date();
+        }
+        else
+        {
+            dateTime = new Date(viewer.vcr.position());
+            if (dateTime.getYear() == UNSET_POSITION_YEAR)
+            {
+                dateTime = oleAutomationDateToDate(viewer.vcr.clip.start);
+            }
+        }
+    }
+    $("cameraTime").style.display = "inline";
+    $("cameraTime").innerHTML =
+        dateTime.toTimeString() + " " + dateTime.toDateString();
+}
+
+//----------------------------------------------------------------------------
+// go to a live view of the data
+function golive()
+{
+    viewer.state(viewer.State.live);
+    viewer.live.camera(new Camera(1, "192.168.1.152", "YourDevice", "Device"));
+}
+
+//----------------------------------------------------------------------------
+// Rewind
+// We do not play video in reverse. At least for now, just rewind to beginning.
+function reverse()
+{
+    viewer.assureVcr();
+    viewer.vcr.reset();
+}
+
+//----------------------------------------------------------------------------
+// go to the previous frame
+function previousframe()
+{
+    viewer.assureVcr();
+    viewer.vcr.previous();
+}
+
+//----------------------------------------------------------------------------
+// start playing normal speed
+function play()
+{
+    viewer.assureVcr();
+    viewer.vcr.play();
+}
+
+//----------------------------------------------------------------------------
+// pause
+function pause()
+{
+    viewer.assureVcr();
+    viewer.vcr.pause();
+}
+
+//----------------------------------------------------------------------------
+// go to the next frame
+function nextframe()
+{
+    viewer.assureVcr();
+    viewer.vcr.next();
+}
+
+//----------------------------------------------------------------------------
+// Fast Forward in increasing amounts
+function fastforward()
+{
+    viewer.assureVcr();
+    viewer.vcr.fastForward();
+}
+
+//----------------------------------------------------------------------------
+// Rewind by 15 seconds
+function rewindevent()
+{
+    viewer.assureVcr();
+    viewer.vcr.reposition(-15 * 1000);
+}
+
+//----------------------------------------------------------------------------
+// Replace the current image for this object with the new image
+function replaceImage(me, newImage)
+{
+    me.src = newImage;
+    return true;
+}
+
+//----------------------------------------------------------------------------
+// Determines if we should play or pause when the play/pause button is clicked
+function playpause()
+{
+    if (viewer.vcr.playing())
+    {
+        pause();
+    }
+    else
+    {
+        play();
+    }
+}
+
+//----------------------------------------------------------------------------
+// Determines which "highlight" button we show on a mousedown
+function playpausemousehandler()
+{
+    viewer.vcr.goButton.down();
+}
+
+//----------------------------------------------------------------------------
+function loadCamera()
+{
+    golive();
+    return false;
+}
+
+//----------------------------------------------------------------------------
+// Function to stop and unload the viewer
+function unloadViewer()
+{
+    $("oViewer").Disconnect();
+}
+
+//----------------------------------------------------------------------------
+// This function loads and parses the camera data and then hands it off to the
+// loadCamera() routine
+function getData()
+{
+    return loadCamera();
+}
+
+//-->
+</script>
+<style>
+BODY {cursor:default;margin=0px,0px;}
+img {cursor:default;}
+</style>
+</HEAD>
+<body onload="return getData();" onBeforeUnload="return unloadViewer();">
+<script type="text/javascript" for="oViewer" event=onmousedown>onMouseDown();</script>
+<script type="text/javascript" for="oViewer" event=onmouseup>onMouseUp();</script>
+<script type="text/javascript" for="oViewer" event="OnMouseDblClk(Button)">function oViewer::OnMouseDblClk(Button){ Connect(); }</script>
+    <div id="cameraTime" class="dateTime" align="center">&nbsp;</div>
+    <div id="myDiv">
+        <img id="noAccess" src="images/novideoaccess.jpg" width="100%" height="100%" border=0 style="display:none;">
+        <!-- The ActiveX object -->
+        <span id="liveVideoSpan">
+            <object classid="clsid:E4124BA9-9CDA-4954-893E-CB7A035CA0BC" codebase="MYVideoControl2.cab" id="oViewer"
+                name="Camera" class="Cameras" onmousemove="onMouseMove()" onmousewheel="return onScrollWheel()"
+                style="width:100%;height:100%;text-align:center">
+                <param name="FPS" value="8"/>
+                <param name="Quality" value="100"/>
+                <param name="KeyframeRate" value="8"/>
+                <param name="ShowStatus" value="-1"/>
+            </object>
+        </span>
+    </div>
+  </body>
+</HTML>
+
